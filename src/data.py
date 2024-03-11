@@ -10,17 +10,18 @@ from typing import List
 
 import pandas as pd
 import numpy as np
+import math
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.optim import Adam
 from torch.utils.data import Dataset, DataLoader
-import tensorboard
+from torch.utils.data import Sampler, BatchSampler, RandomSampler, SequentialSampler
+from torch.nn.utils.rnn import pad_sequence
 
 import lightning as L
 
 COLUMNS = ["seq", "go"]
+SOS = "<SOS>"
 EOS = "<EOS>"
+BATCH_SIZE = 16
 
 
 class ProteinDataset(Dataset):
@@ -33,8 +34,12 @@ class ProteinDataset(Dataset):
             .set_index("Entry")
         )
         if dropna:
-            # We may want to drop NAs because we want to predict if GO terms are unknown (?)ı
+            # We may want to drop NAs because we want to predict if GO terms are unknown (?)
             data = data.dropna()
+
+        # We sort by the sequence length so we can get more useful batches
+        data["seq_len"] = data["seq"].apply(lambda s: len(s))
+        data.sort_values("seq_len", inplace=True)
         return data
 
     # @staticmethod
@@ -57,12 +62,15 @@ class ProteinDataset(Dataset):
             else:
                 raise NotImplementedError(f"{col} not implemented")
 
+            vocabulary.append(SOS)
             vocabulary.append(EOS)
             vocabularies[col] = vocabulary
         return vocabularies
 
     def encode(self, input_str: List[str], col: str):
-        return [self.encoding[col][s] for s in input_str]
+        return torch.tensor(
+            [self.encoding[col][s] for s in input_str], dtype=torch.float32
+        )
 
     def decode(self, input_encoding: List[int], col: str):
         return "".join([self.decoding[col][i] for i in input_encoding])
@@ -83,23 +91,85 @@ class ProteinDataset(Dataset):
     def __len__(self):
         return len(self.raw_data)
 
-    def __getitem__(self, item):
+    def __getitem__(self, item: int):
         data_line = self.raw_data.iloc[item]
         X, y = data_line[COLUMNS]
 
         # We finish the AA sequence with EOS to say we're done
         X_enc = self.encode(list(X) + [EOS], COLUMNS[0])
 
-        # We start the GO terms with EOS to say we're starting to generate from nothing
+        # We start the GO terms with SOS to say we're starting to generate from nothing
         # We also end with EOS to say we're done generating terms
-        y_enc = self.encode([EOS] + self.split_go_terms(y) + [EOS], COLUMNS[1])
+        y_enc = self.encode([SOS] + self.split_go_terms(y) + [EOS], COLUMNS[1])
 
-        return {"seq": torch.tensor(X_enc), "go": torch.tensor(y_enc)}
+        return {"seq": X_enc, "go": y_enc}
+
+    def collate_batch(self, batch):
+        # Assuming each item is a tuple (data, label)
+        X_input = [item[COLUMNS[0]] for item in batch]
+        y_input = [item[COLUMNS[1]] for item in batch]
+
+        # Pad the data
+        X_padded = pad_sequence(
+            X_input, batch_first=True, padding_value=self.encoding["seq"][EOS]
+        )
+        y_padded = pad_sequence(
+            y_input, batch_first=True, padding_value=self.encoding["go"][EOS]
+        )
+
+        return {COLUMNS[0]: X_padded, COLUMNS[1]: y_padded}
+
+
+class ProteinBatchSampler(BatchSampler):
+    def __init__(
+        self,
+        dataset: ProteinDataset,
+        sampler_class: Sampler = RandomSampler,
+        batch_size: int = BATCH_SIZE,
+        drop_last: bool = False,
+    ):
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.num_batches = math.ceil(len(dataset) / batch_size)
+        self.sampler = sampler_class(range(self.num_batches))
+        self.dataset = dataset
+
+        # Create the batches of idxs
+        batches = []
+        for batch_num in range(self.num_batches):
+            start_idx = batch_num * self.batch_size
+            end_idx = min((batch_num + 1) * self.batch_size, len(self.dataset))
+            batches.append(list(range(start_idx, end_idx)))
+
+        if self.drop_last and len(batches[-1]) != self.batch_size:
+            batches = batches[:-1]
+
+        self.batches = batches
+
+    def __iter__(self):
+        for idx in self.sampler:
+            yield self.batches[idx]
+
+    def __len__(self):
+        return len(self.batches)
 
 
 class ProteinDataLoader(DataLoader):
-    def __init__(self, dataset: ProteinDataset):
-        super().__init__(dataset)
-
-    def get_batch(self, batch_size):
-        pass
+    def __init__(
+        self,
+        dataset: ProteinDataset,
+        batch_size: int = BATCH_SIZE,
+        shuffle: bool = True,
+        drop_last: bool = False,
+    ):
+        batch_sampler = ProteinBatchSampler(
+            dataset,
+            sampler_class=RandomSampler if shuffle else SequentialSampler,
+            batch_size=batch_size,
+            drop_last=drop_last,
+        )
+        super().__init__(
+            dataset,
+            batch_sampler=batch_sampler,
+            collate_fn=dataset.collate_batch,
+        )
