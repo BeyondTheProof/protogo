@@ -105,19 +105,15 @@ class ProteinDataset(Dataset):
         return {"seq": X_enc, "go": y_enc}
 
     def collate_batch(self, batch):
-        # Assuming each item is a tuple (data, label)
-        X_input = [item[COLUMNS[0]] for item in batch]
-        y_input = [item[COLUMNS[1]] for item in batch]
+        collated = {}
+        for col in COLUMNS:
+            _input = [item[col] for item in batch]
+            _padded = pad_sequence(
+                _input, batch_first=True, padding_value=self.encoding[col][EOS]
+            )
+            collated[col] = _input
 
-        # Pad the data
-        X_padded = pad_sequence(
-            X_input, batch_first=True, padding_value=self.encoding["seq"][EOS]
-        )
-        y_padded = pad_sequence(
-            y_input, batch_first=True, padding_value=self.encoding["go"][EOS]
-        )
-
-        return {COLUMNS[0]: X_padded, COLUMNS[1]: y_padded}
+        return collated
 
 
 class ProteinBatchSampler(BatchSampler):
