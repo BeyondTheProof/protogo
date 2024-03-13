@@ -13,19 +13,28 @@ import torch.nn.functional as F
 
 # import lightning as L
 
-BATCH_SIZE: int = 8  # B
 
 AA_MAX_LEN: int = 36000
-AA_VOCAB_SIZE: int = 24 + 1  # 24 amino acids and <EOS>
+AA_VOCAB_SIZE: int = 24 + 2  # 24 amino acids and <SOS>, <EOS>
 
 GO_MAX_LEN: int = 256  # T
 NUM_EMBED: int = 16  # C
-GO_VOCAB_SIZE: int = 18789 + 1  # 18789 amino acids and <EOS>
+GO_VOCAB_SIZE: int = 18789 + 2  # 18789 GO terms and <SOS>, <EOS>
 
 HEAD_SIZE: int = NUM_EMBED
+NUM_ENCODER_LAYERS: int = 1
+NUM_DECODER_LAYERS: int = 1
 
 
 class EncoderHead(nn.Module):
+    """
+    Takes a tensor of size (Batch, Time, Channel), where |Channel| == batch_size and linearly transforms
+    to (B, T, head_size), where |head_size| == batch_size, once each for `query`, `key`, and `value`
+
+    Then does matrix multiplication between `query` and `key`, then takes softmax over last dimension,
+    and multiplies it by the `value`
+    """
+
     def __init__(
         self,
         num_embed: int = NUM_EMBED,
@@ -47,8 +56,10 @@ class EncoderHead(nn.Module):
         v = self.value(x)
 
         # Dot product the queries and the keys, scale by the number of channels
-        # q.shape: (B, T, head_size)
+        # q.shape: (B, T, C)
+        # k.transpose.shape: (B, C, T)
         # weights.shape: (B, T, T)
+        # divide by sqrt(C) to normalize
         weights = q @ k.transpose(-2, -1) * (C**-0.5)
         weights = weights.softmax(dim=-1)
         # (B, T, T) @ (B, T, head_size) -> (B, T, head_size)
@@ -57,6 +68,11 @@ class EncoderHead(nn.Module):
 
 
 class DecoderHead(nn.Module):
+    """
+    Similar to the EncoderHead, with the only difference being that it masks all positions
+    after a given one with torch.tril, filling with -inf logits
+    """
+
     def __init__(
         self,
         num_embed: int = NUM_EMBED,
@@ -73,6 +89,9 @@ class DecoderHead(nn.Module):
         self.key = nn.Linear(self.num_embed, self.head_size, bias=False)
         self.value = nn.Linear(self.num_embed, self.head_size, bias=False)
 
+        # These are not weights, but a buffer, so it doesn't update with loss.backward()
+        # We take a 1s square matrix of size max_len, then just the lower triangle (with diagonal),
+        # setting the rest to 0s
         self.register_buffer("tril", torch.tril(torch.ones(max_len, max_len)))
 
     def forward(self, x):
@@ -82,9 +101,12 @@ class DecoderHead(nn.Module):
         v = self.value(x)
 
         # Dot product the queries and the keys, scale by the number of channels
-        # q.shape: (B, T, head_size)
+        # q.shape: (B, T, C)
+        # k.transpose.shape: (B, C, T)
         # weights.shape: (B, T, T)
         weights = q @ k.transpose(-2, -1) * (C**-0.5)
+
+        # Wherever tril (up to size T) is 0 (upper triangle), set the corresponding weights to -inf
         weights = weights.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
         weights = weights.softmax(dim=-1)
 
@@ -94,14 +116,43 @@ class DecoderHead(nn.Module):
 
 
 class AAEncoder(nn.Module):
+    """
+    This module takes in a numeric encoding of the tokens, and passes through the (stack of)
+    encoder layers.
+
+    It:
+     1. Embeds it in a higher-dimensional space (num_embed)
+     2. Adds positional encoding + residual
+     3. Adds self-attention + residual
+    """
+
     def register_positional_embedding(self):
-        # Positions of tokens
+        """
+        Registers a buffer of positional encodings based on alternating sines and cosines of
+        decreasing frequency. This is smart, since it's easy to find combinations of similar
+        distances, and sine and cosine are out of phase
+        """
+        # Makes a column vector of shape (max_len, 1). These are the positions of tokens
         position = torch.arange(self.max_len).unsqueeze(1)
+
+        # This is the 'div' term because of the -log(10_000)
+        # We do range(0, 2, ..., num_embed-2) because each of these values goes to a specific
+        # channel, and we have alternating sines and cosines, so we would double to get num_embed.
+        # PE_pos = sin(pos / 10_000^(2i / d_model)
         div_term = torch.exp(
-            torch.arange(0, self.num_embed, 2) * (-math.log(10000.0) / self.num_embed)
+            # ---------- 2i ------------
+            torch.arange(0, self.num_embed, 2)
+            # ----- 10_000^ -----   -- / d_model --
+            * (-math.log(10000.0) / self.num_embed)
         )
+
         # Positional embedding has the same dimension as token embedding
+        # There is a `1` here in the second dimension
         pe = torch.zeros(self.max_len, 1, self.num_embed)
+
+        # position * div_term is a column times a row, yielding a (pos, num_embed // 2)
+        # Even positions get sin, odd positions get cos
+        # pe.shape: (position, 1, num_embed)
         pe[:, 0, 0::2] = torch.sin(position * div_term)
         pe[:, 0, 1::2] = torch.cos(position * div_term)
         self.register_buffer("pe", pe)
@@ -112,6 +163,7 @@ class AAEncoder(nn.Module):
         num_embed: int = NUM_EMBED,
         head_size: int = HEAD_SIZE,
         max_len: int = AA_MAX_LEN,
+        num_layers: int = NUM_ENCODER_LAYERS,
     ):
         super().__init__()
 
@@ -119,7 +171,7 @@ class AAEncoder(nn.Module):
         self.num_embed = num_embed
         self.head_size = head_size
         self.max_len = max_len
-        self.num_heads = 1
+        self.num_layers = num_layers
 
         self.embedding_table = nn.Embedding(
             num_embeddings=self.vocab_size, embedding_dim=self.num_embed
@@ -131,7 +183,7 @@ class AAEncoder(nn.Module):
                     num_embed=self.num_embed,
                     head_size=self.head_size,
                 )
-                for _ in range(self.num_heads)
+                for _ in range(self.num_layers)
             ]
         )
 
@@ -144,7 +196,9 @@ class AAEncoder(nn.Module):
         # Truncate the input if needed
         x = x[-self.max_len :]
         x = self.embedding_table(x)  # embed
-        x = x + self.pe[: x.size(0)]  # add positional embedding
+        x = (
+            x + self.pe[: x.size(0)]
+        )  # add positional embedding (up to the time-length of x)
         x = x + self.self_attention(x)  # add self-attention
 
         return x
@@ -176,7 +230,7 @@ class GODecoder(nn.Module):
         self.num_embed = num_embed
         self.head_size = head_size
         self.max_len = max_len
-        self.num_heads = 1
+        self.num_layers = NUM_DECODER_LAYERS
 
         self.embedding_table = nn.Embedding(
             num_embeddings=self.vocab_size, embedding_dim=self.num_embed
@@ -189,7 +243,7 @@ class GODecoder(nn.Module):
                     head_size=self.head_size,
                     max_len=self.max_len,
                 )
-                for _ in range(self.num_heads)
+                for _ in range(self.num_layers)
             ]
         )
 
@@ -199,7 +253,7 @@ class GODecoder(nn.Module):
         """
         # Takes an input of shape (batch, time [max_len], channel [num_embed])
 
-        # Truncate the input if needed
+        # Truncate the input if needed, taking the last `max_len` positions
         x = x[-self.max_len :]
 
         x = self.embedding_table(x)  # embed
@@ -210,6 +264,15 @@ class GODecoder(nn.Module):
 
 
 class EncoderDecoderHead(nn.Module):
+    """
+    Encoder-Decoder attention head
+    Takes in input from both encoder and decoder and performs the following:
+     1. Calculates a query for the decoder
+     2. Calculates a key and value for the encoder
+     3. Matrix multiplies (series of dot products) between the decoder query and encoder keys
+     4. Return encoder values weighted by softmax of 3.
+    """
+
     def __init__(self, n_embed: int = NUM_EMBED):
         super().__init__()
         self.n_embed = n_embed
@@ -235,10 +298,17 @@ class EncoderDecoderHead(nn.Module):
         weights = weights.softmax(dim=-1)
 
         out = weights @ enc_v
+
+        # We also add the decoder input as residuals
         return out + x_dec
 
 
 class FeedForward(nn.Module):
+    """
+    This is the final layer in a transformer. It takes the output of the encoder-decoder head
+    and passes it through a dense, fully-connected layer
+    """
+
     def __init__(self, n_embed: int = NUM_EMBED, inner_scaling: int = 1):
         super().__init__()
         self.n_embed = n_embed
@@ -254,6 +324,16 @@ class FeedForward(nn.Module):
 
 
 class Transformer(nn.Module):
+    """
+    Takes in data from both input and output language, and:
+     1. Gets embedding for the input (encoder) and output (decoder)
+     2. Adds positional embedding
+     3. Adds full self-attention for encoder, masked self-attention for decoder (autoregressive framework)
+     4. Adds encoder-decoder attention (cross-attention)
+     5. Passes through fully connected layer
+     6. Passes through a layer to output vocabulary size to get token logits
+    """
+
     def __init__(self, dec_vocab_size: int = GO_VOCAB_SIZE):
         super().__init__()
         self.dec_vocab_size = dec_vocab_size
@@ -267,29 +347,42 @@ class Transformer(nn.Module):
             self.feed_fwd.n_embed * self.feed_fwd.inner_scaling,
             self.dec_vocab_size,
         )
+        self.out_sos = None
+        self.out_eos = None
 
-    def forward(
-        self,
-        data: Dict[str, torch.Tensor],
-        # enc_input: torch.Tensor,
-        # dec_input: torch.Tensor,
-        # train: bool = False
-    ):
+    def check_update_sos_eos(self, dec_input: torch.tensor):
+        if dec_input.dim() == 1:
+            out_sos = dec_input[0].detach()
+            out_eos = dec_input[-1].detach()
+        else:
+            assert dec_input.dim() == 2, dec_input.dim()
+            out_sos = dec_input[0, 0].detach()
+            out_eos = dec_input[0, -1].detach()
 
+        if self.out_sos is None:
+            self.out_sos = out_sos
+        elif not self.out_sos == out_sos:
+            raise ValueError(f"Previous found {self.out_sos=}, now getting {out_sos=}")
+
+        if self.out_eos is None:
+            self.out_eos = out_eos
+        elif not self.out_eos == out_eos:
+            raise ValueError(f"Previous found {self.out_eos=}, now getting {out_eos=}")
+
+    def forward(self, data: Dict[str, torch.Tensor], return_loss: bool = True):
         enc_input = data["seq"]
         dec_input = data["go"]
 
-        # Ensure data has 3 dimensions
+        self.check_update_sos_eos(dec_input)
+
+        # Ensure data has 2 dimensions: (B, T)
         enc_input = enc_input.view(-1, enc_input.size(-1))
         dec_input = dec_input.view(-1, dec_input.size(-1))
 
-        # If we're training, we keep the decoder input as targets.
-        # Otherwise, we take the last token, which is <EOS>
-        # if not train:
-        #     dec_input = dec_input[..., 0]
-
         # Get embeddings for encoder and decoder
         enc_embed = self.encoder(enc_input)
+        # For the decoder, we are always going to predict the next value,
+        # so we don't take the last position (there's no next value)
         dec_embed = self.decoder(dec_input[:, :-1])
 
         # Cross attention (includes residual)
@@ -301,9 +394,35 @@ class Transformer(nn.Module):
         # Get the logits
         logits = self.out_head(x)
 
+        # We reshape the data so that batch and time are treated as B*T separate observations
+        # We may want to reshape only to get the loss, but not when we're generating a output sequence
         B, T, C = logits.shape
         logits = logits.view(B * T, C)
-        targets = dec_input[:, 1:].view(B * T)
-        loss = F.cross_entropy(logits, targets)
+
+        if return_loss:
+            # Targets are always 1 token delayed from the input to the decoder
+            targets = dec_input[:, 1:].reshape(B * T)
+            loss = F.cross_entropy(logits, targets.type(torch.long))
+        else:
+            loss = None
 
         return logits, loss
+
+    def generate(self, data: Dict[str, torch.Tensor], from_sos: bool = True):
+        enc_input = data["seq"]
+        if from_sos:
+            if self.out_sos is None:
+                raise ValueError("self.out_sos is None")
+            dec_input = torch.tensor(self.out_sos).repeat(enc_input.size(0), 1)
+        else:
+            dec_input = data["go"]
+
+        if self.out_eos is None:
+            raise ValueError("self.out_eos is None")
+
+        while set(dec_input[..., -1].detach()) != set(self.out_eos):
+            logits, _ = self(enc_input, dec_input)
+            next_token = torch.argmax(logits, -1)
+            dec_input = torch.stack([dec_input, next_token], dim=-1)
+
+        return dec_input
