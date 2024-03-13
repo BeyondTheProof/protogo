@@ -11,9 +11,16 @@ from typing import List
 import pandas as pd
 import numpy as np
 import math
+
 import torch
-from torch.utils.data import Dataset, DataLoader
-from torch.utils.data import Sampler, BatchSampler, RandomSampler, SequentialSampler
+from torch.utils.data import (
+    Dataset,
+    DataLoader,
+    Sampler,
+    BatchSampler,
+    RandomSampler,
+    SequentialSampler,
+)
 from torch.nn.utils.rnn import pad_sequence
 
 # import lightning as L
@@ -25,13 +32,22 @@ BATCH_SIZE = 16
 
 
 class ProteinDataset(Dataset):
-    def __init__(self, data: pd.DataFrame, vocabs=None, encoding=None, decoding=None):
+    def __init__(
+        self,
+        data: pd.DataFrame,
+        vocabs=None,
+        encoding=None,
+        decoding=None,
+        max_seq_size: int = 5000,
+    ):
         super().__init__()
 
         # We sort by the sequence length so we can get more useful batches
         data["seq_len"] = data["seq"].apply(lambda s: len(s))
+        data.query(f"seq_len <= {max_seq_size}", inplace=True)
         data.sort_values("seq_len", inplace=True)
         self.raw_data = data
+        self.max_seq_size = max_seq_size
 
         self.vocabs = self.get_vocabularies() if vocabs is None else vocabs
         if encoding is None:
@@ -142,8 +158,14 @@ class ProteinDataset(Dataset):
         train_data = self.raw_data.query("is_train").reset_index()
         val_data = self.raw_data.query("~is_train").reset_index()
 
-        ds_train = ProteinDataset(train_data, self.vocabs, self.encoding, self.decoding)
-        ds_val = ProteinDataset(val_data, self.vocabs, self.encoding, self.decoding)
+        kwargs = {
+            "vocabs": self.vocabs,
+            "encoding": self.encoding,
+            "decoding": self.decoding,
+            "max_seq_size": self.max_seq_size,
+        }
+        ds_train = ProteinDataset(train_data, **kwargs)
+        ds_val = ProteinDataset(val_data, **kwargs)
 
         return ds_train, ds_val
 

@@ -4,14 +4,14 @@ It is built on the PyTorch / Lightning architecture.
 Written by: Artur Jaroszewicz (@beyondtheproof)
 """
 
-from typing import Dict, Optional
+from typing import Dict
+import math
 
 import torch
 import torch.nn as nn
-import math
 import torch.nn.functional as F
 
-# import lightning as L
+import lightning as L
 
 
 AA_MAX_LEN: int = 36000
@@ -112,6 +112,29 @@ class DecoderHead(nn.Module):
 
         # (B, T, T) @ (B, T, head_size) -> (B, T, head_size)
         out = weights @ v
+        return out
+
+
+class MultiHead(nn.Module):
+    def __init__(
+        self,
+        head_class: nn.Module,
+        num_embed: int,
+        head_size: int,
+        num_heads: int,
+        # max_len: Optional[int] = None,
+    ):
+        super().__init__()
+        self.heads = nn.ModuleList(
+            [head_class(num_embed, head_size) for _ in range(num_heads)]
+        )
+
+        self.proj = nn.Linear(num_embed, num_embed)
+
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.proj(out)
+
         return out
 
 
@@ -369,11 +392,22 @@ class Transformer(nn.Module):
         elif not self.out_eos == out_eos:
             raise ValueError(f"Previous found {self.out_eos=}, now getting {out_eos=}")
 
-    def forward(self, data: Dict[str, torch.Tensor], return_loss: bool = True):
+    def forward(
+        self,
+        data: Dict[str, torch.Tensor],
+        check_sos_eos: bool = True,
+        split_dec_input: bool = True,
+    ):
         enc_input = data["seq"]
-        dec_input = data["go"]
+        if split_dec_input:
+            dec_input = data["go"][:, :-1]
+            dec_target = data["go"][:, 1:]
+        else:
+            dec_input = data["go"]
+            dec_target = None
 
-        self.check_update_sos_eos(dec_input)
+        if check_sos_eos:
+            self.check_update_sos_eos(dec_input)
 
         # Ensure data has 2 dimensions: (B, T)
         enc_input = enc_input.view(-1, enc_input.size(-1))
@@ -383,46 +417,69 @@ class Transformer(nn.Module):
         enc_embed = self.encoder(enc_input)
         # For the decoder, we are always going to predict the next value,
         # so we don't take the last position (there's no next value)
-        dec_embed = self.decoder(dec_input[:, :-1])
+        dec_embed = self.decoder(dec_input)
 
         # Cross attention (includes residual)
-        x = self.cross_attention_head(enc_embed, dec_embed)
+        x_attn = self.cross_attention_head(enc_embed, dec_embed)
 
         # Final dense layer
-        x = self.feed_fwd(x)
+        x_attn = self.feed_fwd(x_attn)
 
         # Get the logits
-        logits = self.out_head(x)
+        logits = self.out_head(x_attn)
 
-        # We reshape the data so that batch and time are treated as B*T separate observations
-        # We may want to reshape only to get the loss, but not when we're generating a output sequence
-        B, T, C = logits.shape
-        logits = logits.view(B * T, C)
+        if dec_target is not None:
+            # We reshape the data so that batch and time are treated as B*T separate observations
+            # We may want to reshape only to get the loss, but not when we're generating an output sequence
+            B, T, C = logits.shape
+            logits = logits.view(B * T, C)
 
-        if return_loss:
             # Targets are always 1 token delayed from the input to the decoder
-            targets = dec_input[:, 1:].reshape(B * T)
+            # We reshape instead of view because we don't have a contiguous tensor here (dec_input[:, 1:])
+            targets = dec_target.reshape(B * T)
             loss = F.cross_entropy(logits, targets.type(torch.long))
         else:
             loss = None
 
         return logits, loss
 
-    def generate(self, data: Dict[str, torch.Tensor], from_sos: bool = True):
+    def generate(
+        self,
+        data: Dict[str, torch.Tensor],
+        from_sos: bool = True,
+        max_out_len: int = 1000,
+    ):
         enc_input = data["seq"]
+        if enc_input.dim() == 1:
+            enc_input = enc_input.unsqueeze(0)
         if from_sos:
             if self.out_sos is None:
                 raise ValueError("self.out_sos is None")
-            dec_input = torch.tensor(self.out_sos).repeat(enc_input.size(0), 1)
+            dec_input = self.out_sos.repeat(enc_input.size(0), 1)
         else:
             dec_input = data["go"]
 
         if self.out_eos is None:
             raise ValueError("self.out_eos is None")
 
-        while set(dec_input[..., -1].detach()) != set(self.out_eos):
-            logits, _ = self(enc_input, dec_input)
-            next_token = torch.argmax(logits, -1)
-            dec_input = torch.stack([dec_input, next_token], dim=-1)
+        end_token = self.out_eos.tolist()
+        with torch.no_grad():
+            while dec_input.size(-1) < max_out_len:
+                logits, _ = self(
+                    {"seq": enc_input, "go": dec_input},
+                    split_dec_input=False,
+                    check_sos_eos=False,
+                )
+                next_token = torch.argmax(logits, -1)
+                # if next_token.dim() == 1:
+                #     next_token = next_token
+                dec_input = torch.cat(
+                    [dec_input, next_token[..., -1].unsqueeze(1)], dim=-1
+                )
+
+                # Check if we're terminating the generation
+                last_tokens = set(dec_input[..., -1].detach().tolist())
+                if (len(last_tokens) == 1) and (last_tokens.pop() == end_token):
+                    break
 
         return dec_input
