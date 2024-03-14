@@ -57,7 +57,7 @@ def main():
     parser.add_argument(
         "--filepath",
         type=str,
-        default="data/uniprotkb_taxonomy_id_2759_AND_model_or_2024_02_29.tsv.gz",
+        default="/Users/arturj/work/deep_learning/projects/data/uniprotkb_taxonomy_id_2759_AND_model_or_2024_02_29.tsv.gz",
     )
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--num-epochs", type=int, default=1)

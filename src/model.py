@@ -10,7 +10,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from lightning.pytorch.utilities.types import STEP_OUTPUT
 from torch.optim import Adam
 
 import lightning as L
@@ -27,6 +26,7 @@ HEAD_SIZE: int = NUM_EMBED
 NUM_HEADS: int = 4
 NUM_ENCODER_LAYERS: int = 1
 NUM_DECODER_LAYERS: int = 1
+INNER_SCALING: int = 4
 
 
 class EncoderHead(L.LightningModule):
@@ -140,7 +140,6 @@ class AAEncoder(L.LightningModule):
         self,
         vocab_size: int = AA_VOCAB_SIZE,
         num_embed: int = NUM_EMBED,
-        # head_size: int = HEAD_SIZE,
         num_heads: int = NUM_HEADS,
         max_len: int = AA_MAX_LEN,
         num_layers: int = NUM_ENCODER_LAYERS,
@@ -158,18 +157,7 @@ class AAEncoder(L.LightningModule):
             num_embeddings=self.vocab_size, embedding_dim=self.num_embed
         )
         self.register_positional_embedding()
-
-        # if self.num_heads == 1:
-        #     self.self_attention = nn.Sequential(
-        #         *[
-        #             EncoderHead(
-        #                 num_embed=self.num_embed,
-        #                 head_size=self.head_size,
-        #             )
-        #             for _ in range(self.num_layers)
-        #         ]
-        #     )
-        # else:
+        self.ln = nn.LayerNorm(self.num_embed)
         self.self_attention = nn.Sequential(
             *[
                 EncoderMultiHead(
@@ -190,10 +178,9 @@ class AAEncoder(L.LightningModule):
         # Truncate the input if needed
         x = x[-self.max_len :]
         x = self.embedding_table(x)  # embed
-        x = (
-            x + self.pe[: x.size(0)]
-        )  # add positional embedding (up to the time-length of x)
-        x = x + self.self_attention(x)  # add self-attention
+        # add positional embedding (up to the time-length of x)
+        x = x + self.pe[: x.size(0)]
+        x = x + self.self_attention(self.ln(x))  # add self-attention
 
         return x
 
@@ -306,18 +293,6 @@ class GODecoder(L.LightningModule):
             num_embeddings=self.vocab_size, embedding_dim=self.num_embed
         )
         self.register_positional_embedding()
-        # if self.num_heads == 1:
-        #     self.self_attention = nn.Sequential(
-        #         *[
-        #             DecoderHead(
-        #                 num_embed=self.num_embed,
-        #                 head_size=self.head_size,
-        #                 max_len=self.max_len,
-        #             )
-        #             for _ in range(self.num_layers)
-        #         ]
-        #     )
-        # else:
         self.self_attention = nn.Sequential(
             *[
                 DecoderMultiHead(
@@ -329,6 +304,7 @@ class GODecoder(L.LightningModule):
                 for _ in range(self.num_layers)
             ]
         )
+        self.ln = nn.LayerNorm(self.num_embed)
 
     def forward(self, x: torch.Tensor):
         """
@@ -341,7 +317,7 @@ class GODecoder(L.LightningModule):
 
         x = self.embedding_table(x)  # embed
         x = x + self.pe[: x.size(0)]  # add positional embedding
-        x = x + self.self_attention(x)  # add self-attention
+        x = x + self.self_attention(self.ln(x))  # add self-attention
 
         return x
 
@@ -356,17 +332,17 @@ class EncoderDecoderHead(L.LightningModule):
      4. Return encoder values weighted by softmax of 3.
     """
 
-    def __init__(self, head_size: int, n_embed: int = NUM_EMBED):
+    def __init__(self, head_size: int, num_embed: int = NUM_EMBED):
         super().__init__()
-        self.n_embed = n_embed
+        self.num_embed = num_embed
         self.head_size = head_size
 
         # Encoder
-        self.encoder_key = nn.Linear(self.n_embed, self.head_size, bias=False)
-        self.encoder_value = nn.Linear(self.n_embed, self.head_size, bias=False)
+        self.encoder_key = nn.Linear(self.num_embed, self.head_size, bias=False)
+        self.encoder_value = nn.Linear(self.num_embed, self.head_size, bias=False)
 
         # Decoder
-        self.decoder_query = nn.Linear(self.n_embed, self.head_size, bias=False)
+        self.decoder_query = nn.Linear(self.num_embed, self.head_size, bias=False)
 
     def forward(self, x_enc: torch.Tensor, x_dec: torch.Tensor):
         B_enc, T_enc, C_enc = x_enc.shape
@@ -384,16 +360,16 @@ class EncoderDecoderHead(L.LightningModule):
 
 
 class EncoderDecoderMultiHead(L.LightningModule):
-    def __init__(self, num_heads: int, n_embed: int = NUM_EMBED):
+    def __init__(self, num_heads: int, num_embed: int = NUM_EMBED):
         super().__init__()
-        self.n_embed = n_embed
+        self.num_embed = num_embed
         self.num_heads = num_heads
-        self.head_size = self.n_embed // self.num_heads
+        self.head_size = self.num_embed // self.num_heads
 
         self.heads = nn.ModuleList(
             [EncoderDecoderHead(self.head_size) for _ in range(self.num_heads)]
         )
-        self.proj = nn.Linear(self.head_size * self.num_heads, self.n_embed)
+        self.proj = nn.Linear(self.head_size * self.num_heads, self.num_embed)
 
     def forward(self, x_enc, x_dec):
         x = torch.cat([h(x_enc, x_dec) for h in self.heads], dim=-1)
@@ -407,14 +383,14 @@ class FeedForward(L.LightningModule):
     and passes it through a dense, fully-connected layer
     """
 
-    def __init__(self, n_embed: int = NUM_EMBED, inner_scaling: int = 1):
+    def __init__(self, num_embed: int = NUM_EMBED, inner_scaling: int = 1):
         super().__init__()
-        self.n_embed = n_embed
+        self.num_embed = num_embed
         self.inner_scaling = inner_scaling
         self.net = nn.Sequential(
-            nn.Linear(self.n_embed, self.n_embed * self.inner_scaling),
+            nn.Linear(self.num_embed, self.num_embed * self.inner_scaling),
             nn.ReLU(),
-            # nn.Linear(self.n_embed * self.inner_scaling, self.n_embed),
+            nn.Linear(self.num_embed * self.inner_scaling, self.num_embed),
         )
 
     def forward(self, x):
@@ -432,42 +408,25 @@ class Transformer(L.LightningModule):
      6. Passes through a layer to output vocabulary size to get token logits
     """
 
-    def __init__(self, dec_vocab_size: int = GO_VOCAB_SIZE, num_heads: int = NUM_HEADS):
+    def __init__(
+        self,
+        dec_vocab_size: int = GO_VOCAB_SIZE,
+        num_heads: int = NUM_HEADS,
+        ffwd_inner_scaling: int = INNER_SCALING,
+    ):
         super().__init__()
         self.dec_vocab_size = dec_vocab_size
+        self.ffwd_inner_scaling = ffwd_inner_scaling
 
         self.encoder = AAEncoder(num_heads=num_heads)
         self.decoder = GODecoder(num_heads=num_heads)
         self.cross_attention_head = EncoderDecoderMultiHead(num_heads=num_heads)
-        self.feed_fwd = FeedForward()
-        self.out_head = nn.Linear(
-            self.feed_fwd.n_embed * self.feed_fwd.inner_scaling,
-            self.dec_vocab_size,
-        )
+        self.post_x_attn_ln = nn.LayerNorm(self.cross_attention_head.num_embed)
+        self.feed_fwd = FeedForward(inner_scaling=self.ffwd_inner_scaling)
+        self.post_ffwd_ln = nn.LayerNorm(self.feed_fwd.num_embed)
+        self.out_head = nn.Linear(self.feed_fwd.num_embed, self.dec_vocab_size)
         self.out_sos = None
         self.out_eos = None
-
-    def configure_optimizers(self):
-        return Adam(self.parameters())
-
-    def check_update_sos_eos(self, dec_input: torch.tensor):
-        if dec_input.dim() == 1:
-            out_sos = dec_input[0].detach()
-            out_eos = dec_input[-1].detach()
-        else:
-            assert dec_input.dim() == 2, dec_input.dim()
-            out_sos = dec_input[0, 0].detach()
-            out_eos = dec_input[0, -1].detach()
-
-        if self.out_sos is None:
-            self.out_sos = out_sos
-        elif not self.out_sos == out_sos:
-            raise ValueError(f"Previous found {self.out_sos=}, now getting {out_sos=}")
-
-        if self.out_eos is None:
-            self.out_eos = out_eos
-        elif not self.out_eos == out_eos:
-            raise ValueError(f"Previous found {self.out_eos=}, now getting {out_eos=}")
 
     def forward(self, data: Dict[str, torch.Tensor]):
         enc_input = data["seq"]
@@ -487,10 +446,10 @@ class Transformer(L.LightningModule):
         x_attn = dec_embed + self.cross_attention_head(enc_embed, dec_embed)
 
         # Final dense layer
-        x_attn = self.feed_fwd(x_attn)
+        x_attn = self.feed_fwd(self.post_x_attn_ln(x_attn))
 
         # Get the logits
-        logits = self.out_head(x_attn)
+        logits = self.out_head(self.post_ffwd_ln(x_attn))
 
         return logits
 
@@ -515,6 +474,28 @@ class Transformer(L.LightningModule):
         loss = F.cross_entropy(logits, targets.type(torch.long))
 
         return loss
+
+    def configure_optimizers(self):
+        return Adam(self.parameters())
+
+    def check_update_sos_eos(self, dec_input: torch.tensor):
+        if dec_input.dim() == 1:
+            out_sos = dec_input[0].detach()
+            out_eos = dec_input[-1].detach()
+        else:
+            assert dec_input.dim() == 2, dec_input.dim()
+            out_sos = dec_input[0, 0].detach()
+            out_eos = dec_input[0, -1].detach()
+
+        if self.out_sos is None:
+            self.out_sos = out_sos
+        elif not self.out_sos == out_sos:
+            raise ValueError(f"Previous found {self.out_sos=}, now getting {out_sos=}")
+
+        if self.out_eos is None:
+            self.out_eos = out_eos
+        elif not self.out_eos == out_eos:
+            raise ValueError(f"Previous found {self.out_eos=}, now getting {out_eos=}")
 
     def training_step(self, data):
         loss = self.get_loss(data)
@@ -548,14 +529,8 @@ class Transformer(L.LightningModule):
         end_token = self.out_eos.tolist()
         with torch.no_grad():
             while dec_input.size(-1) < max_out_len:
-                logits, _ = self(
-                    {"seq": enc_input, "go": dec_input},
-                    # split_dec_input=False,
-                    # check_sos_eos=False,
-                )
+                logits, _ = self({"seq": enc_input, "go": dec_input})
                 next_token = torch.argmax(logits, -1)
-                # if next_token.dim() == 1:
-                #     next_token = next_token
                 dec_input = torch.cat(
                     [dec_input, next_token[..., -1].unsqueeze(1)], dim=-1
                 )

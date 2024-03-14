@@ -23,8 +23,6 @@ from torch.utils.data import (
 )
 from torch.nn.utils.rnn import pad_sequence
 
-# import lightning as L
-
 COLUMNS = ["seq", "go"]
 SOS = "<SOS>"
 EOS = "<EOS>"
