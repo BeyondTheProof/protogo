@@ -12,13 +12,13 @@ import torch
 import torch.nn as nn
 from torch.optim import Adam
 
-# import lightning as L
+import lightning as L
 
 from .data import ProteinDataset, ProteinDataLoader, BATCH_SIZE
 from .model import Transformer
 
 
-def train_model(model: nn.Module, dl_train, dl_val, args):
+def train_model_torch(model: nn.Module, dl_train, dl_val, args):
     optimizer = Adam(model.parameters(), lr=args.learning_rate)
     val_losses = []
 
@@ -47,6 +47,11 @@ def train_model(model: nn.Module, dl_train, dl_val, args):
             optimizer.step()
 
 
+def train_model_lit(model: L.LightningModule, dl_train, dl_val, args):
+    trainer = L.Trainer(max_epochs=args.max_epochs, accelerator=args.device)
+    trainer.fit(model, train_dataloaders=dl_train, val_dataloaders=dl_val)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -59,6 +64,7 @@ def main():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--eval_interval", type=int, default=500)
     parser.add_argument("--learning-rate", type=float, default=0.001)
+    parser.add_argument("--device", type=str, default="cpu")
     args = parser.parse_args()
 
     ds = ProteinDataset.from_csv(args.filepath)
@@ -72,4 +78,4 @@ def main():
 
     transformer = Transformer()
 
-    train_model(transformer, dl_train, dl_val, args)
+    train_model_lit(transformer, dl_train, dl_val, args)

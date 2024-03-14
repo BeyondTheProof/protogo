@@ -4,12 +4,14 @@ It is built on the PyTorch / Lightning architecture.
 Written by: Artur Jaroszewicz (@beyondtheproof)
 """
 
-from typing import Dict
+from typing import Dict, Any
 import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from lightning.pytorch.utilities.types import STEP_OUTPUT
+from torch.optim import Adam
 
 import lightning as L
 
@@ -22,11 +24,12 @@ NUM_EMBED: int = 16  # C
 GO_VOCAB_SIZE: int = 18789 + 2  # 18789 GO terms and <SOS>, <EOS>
 
 HEAD_SIZE: int = NUM_EMBED
+NUM_HEADS: int = 4
 NUM_ENCODER_LAYERS: int = 1
 NUM_DECODER_LAYERS: int = 1
 
 
-class EncoderHead(nn.Module):
+class EncoderHead(L.LightningModule):
     """
     Takes a tensor of size (Batch, Time, Channel), where |Channel| == batch_size and linearly transforms
     to (B, T, head_size), where |head_size| == batch_size, once each for `query`, `key`, and `value`
@@ -67,7 +70,135 @@ class EncoderHead(nn.Module):
         return out
 
 
-class DecoderHead(nn.Module):
+class EncoderMultiHead(L.LightningModule):
+    def __init__(
+        self,
+        num_embed: int,
+        head_size: int,
+        num_heads: int,
+    ):
+        super().__init__()
+        self.heads = nn.ModuleList(
+            [
+                EncoderHead(num_embed=num_embed, head_size=head_size)
+                for _ in range(num_heads)
+            ]
+        )
+
+        self.proj = nn.Linear(num_embed, num_embed)
+
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.proj(out)
+
+        return out
+
+
+class AAEncoder(L.LightningModule):
+    """
+    This module takes in a numeric encoding of the tokens, and passes through the (stack of)
+    encoder layers.
+
+    It:
+     1. Embeds it in a higher-dimensional space (num_embed)
+     2. Adds positional encoding + residual
+     3. Adds self-attention + residual
+    """
+
+    def register_positional_embedding(self):
+        """
+        Registers a buffer of positional encodings based on alternating sines and cosines of
+        decreasing frequency. This is smart, since it's easy to find combinations of similar
+        distances, and sine and cosine are out of phase
+        """
+        # Makes a column vector of shape (max_len, 1). These are the positions of tokens
+        position = torch.arange(self.max_len).unsqueeze(1)
+
+        # This is the 'div' term because of the -log(10_000)
+        # We do range(0, 2, ..., num_embed-2) because each of these values goes to a specific
+        # channel, and we have alternating sines and cosines, so we would double to get num_embed.
+        # PE_pos = sin(pos / 10_000^(2i / d_model)
+        div_term = torch.exp(
+            # ---------- 2i ------------
+            torch.arange(0, self.num_embed, 2)
+            # ----- 10_000^ -----   -- / d_model --
+            * (-math.log(10000.0) / self.num_embed)
+        )
+
+        # Positional embedding has the same dimension as token embedding
+        # There is a `1` here in the second dimension
+        pe = torch.zeros(self.max_len, 1, self.num_embed)
+
+        # position * div_term is a column times a row, yielding a (pos, num_embed // 2)
+        # Even positions get sin, odd positions get cos
+        # pe.shape: (position, 1, num_embed)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe)
+
+    def __init__(
+        self,
+        vocab_size: int = AA_VOCAB_SIZE,
+        num_embed: int = NUM_EMBED,
+        # head_size: int = HEAD_SIZE,
+        num_heads: int = NUM_HEADS,
+        max_len: int = AA_MAX_LEN,
+        num_layers: int = NUM_ENCODER_LAYERS,
+    ):
+        super().__init__()
+
+        self.vocab_size = vocab_size
+        self.num_embed = num_embed
+        self.num_heads = num_heads
+        self.head_size = num_embed // self.num_heads
+        self.max_len = max_len
+        self.num_layers = num_layers
+
+        self.embedding_table = nn.Embedding(
+            num_embeddings=self.vocab_size, embedding_dim=self.num_embed
+        )
+        self.register_positional_embedding()
+
+        # if self.num_heads == 1:
+        #     self.self_attention = nn.Sequential(
+        #         *[
+        #             EncoderHead(
+        #                 num_embed=self.num_embed,
+        #                 head_size=self.head_size,
+        #             )
+        #             for _ in range(self.num_layers)
+        #         ]
+        #     )
+        # else:
+        self.self_attention = nn.Sequential(
+            *[
+                EncoderMultiHead(
+                    num_embed=self.num_embed,
+                    head_size=self.head_size,
+                    num_heads=self.num_heads,
+                )
+                for _ in range(self.num_layers)
+            ]
+        )
+
+    def forward(self, x: torch.Tensor):
+        """
+        Returns a positional, self-attention embedding of input tokens which are amino acid residues
+        """
+        # Takes an input of shape (batch, time [max_len], channel [num_embed])
+
+        # Truncate the input if needed
+        x = x[-self.max_len :]
+        x = self.embedding_table(x)  # embed
+        x = (
+            x + self.pe[: x.size(0)]
+        )  # add positional embedding (up to the time-length of x)
+        x = x + self.self_attention(x)  # add self-attention
+
+        return x
+
+
+class DecoderHead(L.LightningModule):
     """
     Similar to the EncoderHead, with the only difference being that it masks all positions
     after a given one with torch.tril, filling with -inf logits
@@ -115,18 +246,20 @@ class DecoderHead(nn.Module):
         return out
 
 
-class MultiHead(nn.Module):
+class DecoderMultiHead(L.LightningModule):
     def __init__(
         self,
-        head_class: nn.Module,
         num_embed: int,
         head_size: int,
         num_heads: int,
-        # max_len: Optional[int] = None,
+        max_len: int = GO_MAX_LEN,
     ):
         super().__init__()
         self.heads = nn.ModuleList(
-            [head_class(num_embed, head_size) for _ in range(num_heads)]
+            [
+                DecoderHead(num_embed=num_embed, head_size=head_size, max_len=max_len)
+                for _ in range(num_heads)
+            ]
         )
 
         self.proj = nn.Linear(num_embed, num_embed)
@@ -138,96 +271,7 @@ class MultiHead(nn.Module):
         return out
 
 
-class AAEncoder(nn.Module):
-    """
-    This module takes in a numeric encoding of the tokens, and passes through the (stack of)
-    encoder layers.
-
-    It:
-     1. Embeds it in a higher-dimensional space (num_embed)
-     2. Adds positional encoding + residual
-     3. Adds self-attention + residual
-    """
-
-    def register_positional_embedding(self):
-        """
-        Registers a buffer of positional encodings based on alternating sines and cosines of
-        decreasing frequency. This is smart, since it's easy to find combinations of similar
-        distances, and sine and cosine are out of phase
-        """
-        # Makes a column vector of shape (max_len, 1). These are the positions of tokens
-        position = torch.arange(self.max_len).unsqueeze(1)
-
-        # This is the 'div' term because of the -log(10_000)
-        # We do range(0, 2, ..., num_embed-2) because each of these values goes to a specific
-        # channel, and we have alternating sines and cosines, so we would double to get num_embed.
-        # PE_pos = sin(pos / 10_000^(2i / d_model)
-        div_term = torch.exp(
-            # ---------- 2i ------------
-            torch.arange(0, self.num_embed, 2)
-            # ----- 10_000^ -----   -- / d_model --
-            * (-math.log(10000.0) / self.num_embed)
-        )
-
-        # Positional embedding has the same dimension as token embedding
-        # There is a `1` here in the second dimension
-        pe = torch.zeros(self.max_len, 1, self.num_embed)
-
-        # position * div_term is a column times a row, yielding a (pos, num_embed // 2)
-        # Even positions get sin, odd positions get cos
-        # pe.shape: (position, 1, num_embed)
-        pe[:, 0, 0::2] = torch.sin(position * div_term)
-        pe[:, 0, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe)
-
-    def __init__(
-        self,
-        vocab_size: int = AA_VOCAB_SIZE,
-        num_embed: int = NUM_EMBED,
-        head_size: int = HEAD_SIZE,
-        max_len: int = AA_MAX_LEN,
-        num_layers: int = NUM_ENCODER_LAYERS,
-    ):
-        super().__init__()
-
-        self.vocab_size = vocab_size
-        self.num_embed = num_embed
-        self.head_size = head_size
-        self.max_len = max_len
-        self.num_layers = num_layers
-
-        self.embedding_table = nn.Embedding(
-            num_embeddings=self.vocab_size, embedding_dim=self.num_embed
-        )
-        self.register_positional_embedding()
-        self.self_attention = nn.Sequential(
-            *[
-                EncoderHead(
-                    num_embed=self.num_embed,
-                    head_size=self.head_size,
-                )
-                for _ in range(self.num_layers)
-            ]
-        )
-
-    def forward(self, x: torch.Tensor):
-        """
-        Returns a positional, self-attention embedding of input tokens which are amino acid residues
-        """
-        # Takes an input of shape (batch, time [max_len], channel [num_embed])
-
-        # Truncate the input if needed
-        x = x[-self.max_len :]
-        x = self.embedding_table(x)  # embed
-        x = (
-            x + self.pe[: x.size(0)]
-        )  # add positional embedding (up to the time-length of x)
-        x = x + self.self_attention(x)  # add self-attention
-
-        return x
-
-
-class GODecoder(nn.Module):
+class GODecoder(L.LightningModule):
     def register_positional_embedding(self):
         # Positions of tokens
         position = torch.arange(self.max_len).unsqueeze(1)
@@ -244,14 +288,17 @@ class GODecoder(nn.Module):
         self,
         vocab_size: int = GO_VOCAB_SIZE,
         num_embed: int = NUM_EMBED,
-        head_size: int = HEAD_SIZE,
+        num_heads: int = NUM_HEADS,
+        # head_size: int = HEAD_SIZE,
         max_len: int = GO_MAX_LEN,
     ):
         super().__init__()
 
         self.vocab_size = vocab_size
         self.num_embed = num_embed
-        self.head_size = head_size
+        self.num_heads = num_heads
+        # self.head_size = head_size
+        self.head_size = num_embed // self.num_heads
         self.max_len = max_len
         self.num_layers = NUM_DECODER_LAYERS
 
@@ -259,12 +306,25 @@ class GODecoder(nn.Module):
             num_embeddings=self.vocab_size, embedding_dim=self.num_embed
         )
         self.register_positional_embedding()
+        # if self.num_heads == 1:
+        #     self.self_attention = nn.Sequential(
+        #         *[
+        #             DecoderHead(
+        #                 num_embed=self.num_embed,
+        #                 head_size=self.head_size,
+        #                 max_len=self.max_len,
+        #             )
+        #             for _ in range(self.num_layers)
+        #         ]
+        #     )
+        # else:
         self.self_attention = nn.Sequential(
             *[
-                DecoderHead(
+                DecoderMultiHead(
                     num_embed=self.num_embed,
                     head_size=self.head_size,
                     max_len=self.max_len,
+                    num_heads=self.num_heads,
                 )
                 for _ in range(self.num_layers)
             ]
@@ -286,7 +346,7 @@ class GODecoder(nn.Module):
         return x
 
 
-class EncoderDecoderHead(nn.Module):
+class EncoderDecoderHead(L.LightningModule):
     """
     Encoder-Decoder attention head
     Takes in input from both encoder and decoder and performs the following:
@@ -296,22 +356,20 @@ class EncoderDecoderHead(nn.Module):
      4. Return encoder values weighted by softmax of 3.
     """
 
-    def __init__(self, n_embed: int = NUM_EMBED):
+    def __init__(self, head_size: int, n_embed: int = NUM_EMBED):
         super().__init__()
         self.n_embed = n_embed
+        self.head_size = head_size
 
         # Encoder
-        self.encoder_key = nn.Linear(n_embed, n_embed, bias=False)
-        self.encoder_value = nn.Linear(n_embed, n_embed, bias=False)
+        self.encoder_key = nn.Linear(self.n_embed, self.head_size, bias=False)
+        self.encoder_value = nn.Linear(self.n_embed, self.head_size, bias=False)
 
         # Decoder
-        self.decoder_query = nn.Linear(n_embed, n_embed, bias=False)
-        # self.decoder_key = nn.Linear(n_embed, n_embed, bias=False)
-        # self.decoder_value = nn.Linear(n_embed, n_embed, bias=False)
+        self.decoder_query = nn.Linear(self.n_embed, self.head_size, bias=False)
 
     def forward(self, x_enc: torch.Tensor, x_dec: torch.Tensor):
         B_enc, T_enc, C_enc = x_enc.shape
-        # B_dec, T_dec, C_dec = x_dec.shape
 
         dec_q = self.decoder_query(x_dec)
         enc_k = self.encoder_key(x_enc)
@@ -322,11 +380,28 @@ class EncoderDecoderHead(nn.Module):
 
         out = weights @ enc_v
 
-        # We also add the decoder input as residuals
-        return out + x_dec
+        return out
 
 
-class FeedForward(nn.Module):
+class EncoderDecoderMultiHead(L.LightningModule):
+    def __init__(self, num_heads: int, n_embed: int = NUM_EMBED):
+        super().__init__()
+        self.n_embed = n_embed
+        self.num_heads = num_heads
+        self.head_size = self.n_embed // self.num_heads
+
+        self.heads = nn.ModuleList(
+            [EncoderDecoderHead(self.head_size) for _ in range(self.num_heads)]
+        )
+        self.proj = nn.Linear(self.head_size * self.num_heads, self.n_embed)
+
+    def forward(self, x_enc, x_dec):
+        x = torch.cat([h(x_enc, x_dec) for h in self.heads], dim=-1)
+        x = self.proj(x)
+        return x
+
+
+class FeedForward(L.LightningModule):
     """
     This is the final layer in a transformer. It takes the output of the encoder-decoder head
     and passes it through a dense, fully-connected layer
@@ -346,7 +421,7 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 
-class Transformer(nn.Module):
+class Transformer(L.LightningModule):
     """
     Takes in data from both input and output language, and:
      1. Gets embedding for the input (encoder) and output (decoder)
@@ -357,14 +432,13 @@ class Transformer(nn.Module):
      6. Passes through a layer to output vocabulary size to get token logits
     """
 
-    def __init__(self, dec_vocab_size: int = GO_VOCAB_SIZE):
+    def __init__(self, dec_vocab_size: int = GO_VOCAB_SIZE, num_heads: int = NUM_HEADS):
         super().__init__()
         self.dec_vocab_size = dec_vocab_size
 
-        self.encoder = AAEncoder()
-        self.decoder = GODecoder()
-
-        self.cross_attention_head = EncoderDecoderHead()
+        self.encoder = AAEncoder(num_heads=num_heads)
+        self.decoder = GODecoder(num_heads=num_heads)
+        self.cross_attention_head = EncoderDecoderMultiHead(num_heads=num_heads)
         self.feed_fwd = FeedForward()
         self.out_head = nn.Linear(
             self.feed_fwd.n_embed * self.feed_fwd.inner_scaling,
@@ -372,6 +446,9 @@ class Transformer(nn.Module):
         )
         self.out_sos = None
         self.out_eos = None
+
+    def configure_optimizers(self):
+        return Adam(self.parameters())
 
     def check_update_sos_eos(self, dec_input: torch.tensor):
         if dec_input.dim() == 1:
@@ -392,22 +469,9 @@ class Transformer(nn.Module):
         elif not self.out_eos == out_eos:
             raise ValueError(f"Previous found {self.out_eos=}, now getting {out_eos=}")
 
-    def forward(
-        self,
-        data: Dict[str, torch.Tensor],
-        check_sos_eos: bool = True,
-        split_dec_input: bool = True,
-    ):
+    def forward(self, data: Dict[str, torch.Tensor]):
         enc_input = data["seq"]
-        if split_dec_input:
-            dec_input = data["go"][:, :-1]
-            dec_target = data["go"][:, 1:]
-        else:
-            dec_input = data["go"]
-            dec_target = None
-
-        if check_sos_eos:
-            self.check_update_sos_eos(dec_input)
+        dec_input = data["go"]
 
         # Ensure data has 2 dimensions: (B, T)
         enc_input = enc_input.view(-1, enc_input.size(-1))
@@ -420,7 +484,7 @@ class Transformer(nn.Module):
         dec_embed = self.decoder(dec_input)
 
         # Cross attention (includes residual)
-        x_attn = self.cross_attention_head(enc_embed, dec_embed)
+        x_attn = dec_embed + self.cross_attention_head(enc_embed, dec_embed)
 
         # Final dense layer
         x_attn = self.feed_fwd(x_attn)
@@ -428,20 +492,39 @@ class Transformer(nn.Module):
         # Get the logits
         logits = self.out_head(x_attn)
 
-        if dec_target is not None:
-            # We reshape the data so that batch and time are treated as B*T separate observations
-            # We may want to reshape only to get the loss, but not when we're generating an output sequence
-            B, T, C = logits.shape
-            logits = logits.view(B * T, C)
+        return logits
 
-            # Targets are always 1 token delayed from the input to the decoder
-            # We reshape instead of view because we don't have a contiguous tensor here (dec_input[:, 1:])
-            targets = dec_target.reshape(B * T)
-            loss = F.cross_entropy(logits, targets.type(torch.long))
-        else:
-            loss = None
+    def get_loss(self, data):
+        if (self.out_sos is None) or (self.out_eos is None):
+            self.check_update_sos_eos(data["go"])
 
-        return logits, loss
+        enc_input = data["seq"]
+        dec_input = data["go"][:, :-1]
+        dec_target = data["go"][:, 1:]
+
+        logits = self({"seq": enc_input, "go": dec_input})
+
+        # We reshape the data so that batch and time are treated as B*T separate observations
+        # We may want to reshape only to get the loss, but not when we're generating an output sequence
+        B, T, C = logits.shape
+        logits = logits.view(B * T, C)
+
+        # Targets are always 1 token delayed from the input to the decoder
+        # We reshape instead of view because we don't have a contiguous tensor here (dec_input[:, 1:])
+        targets = dec_target.reshape(B * T)
+        loss = F.cross_entropy(logits, targets.type(torch.long))
+
+        return loss
+
+    def training_step(self, data):
+        loss = self.get_loss(data)
+        self.log("train_loss", loss)
+        return loss
+
+    def validation_step(self, data):
+        loss = self.get_loss(data)
+        self.log("val_loss", loss)
+        return loss
 
     def generate(
         self,
@@ -467,8 +550,8 @@ class Transformer(nn.Module):
             while dec_input.size(-1) < max_out_len:
                 logits, _ = self(
                     {"seq": enc_input, "go": dec_input},
-                    split_dec_input=False,
-                    check_sos_eos=False,
+                    # split_dec_input=False,
+                    # check_sos_eos=False,
                 )
                 next_token = torch.argmax(logits, -1)
                 # if next_token.dim() == 1:

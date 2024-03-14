@@ -264,6 +264,7 @@ class ProteinDataLoader(DataLoader):
         shuffle: bool = True,
         drop_last: bool = False,
         num_workers: int = 4,
+        persistent_workers: bool = True,
     ):
         """
         A torch data loader that returns a batch of data
@@ -288,4 +289,5 @@ class ProteinDataLoader(DataLoader):
             batch_sampler=self.batch_sampler,
             collate_fn=dataset.collate_batch,
             num_workers=num_workers,
+            persistent_workers=persistent_workers,
         )
