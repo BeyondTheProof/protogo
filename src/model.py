@@ -27,6 +27,7 @@ NUM_HEADS: int = 4
 NUM_ENCODER_LAYERS: int = 1
 NUM_DECODER_LAYERS: int = 1
 INNER_SCALING: int = 4
+DROPOUT: float = 0.25
 
 
 class EncoderHead(L.LightningModule):
@@ -52,6 +53,8 @@ class EncoderHead(L.LightningModule):
         self.key = nn.Linear(self.num_embed, self.head_size, bias=False)
         self.value = nn.Linear(self.num_embed, self.head_size, bias=False)
 
+        self.weight_dropout = nn.Dropout(DROPOUT)
+
     def forward(self, x):
         B, T, C = x.shape
         q = self.query(x)
@@ -64,6 +67,7 @@ class EncoderHead(L.LightningModule):
         # weights.shape: (B, T, T)
         # divide by sqrt(C) to normalize
         weights = q @ k.transpose(-2, -1) * (C**-0.5)
+        weights = self.weight_dropout(weights)
         weights = weights.softmax(dim=-1)
         # (B, T, T) @ (B, T, head_size) -> (B, T, head_size)
         out = weights @ v
@@ -207,6 +211,8 @@ class DecoderHead(L.LightningModule):
         self.key = nn.Linear(self.num_embed, self.head_size, bias=False)
         self.value = nn.Linear(self.num_embed, self.head_size, bias=False)
 
+        self.weight_dropout = nn.Dropout(DROPOUT)
+
         # These are not weights, but a buffer, so it doesn't update with loss.backward()
         # We take a 1s square matrix of size max_len, then just the lower triangle (with diagonal),
         # setting the rest to 0s
@@ -226,6 +232,7 @@ class DecoderHead(L.LightningModule):
 
         # Wherever tril (up to size T) is 0 (upper triangle), set the corresponding weights to -inf
         weights = weights.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
+        weights = self.weight_dropout(weights)
         weights = weights.softmax(dim=-1)
 
         # (B, T, T) @ (B, T, head_size) -> (B, T, head_size)
@@ -390,6 +397,7 @@ class FeedForward(L.LightningModule):
         self.net = nn.Sequential(
             nn.Linear(self.num_embed, self.num_embed * self.inner_scaling),
             nn.ReLU(),
+            nn.Dropout(DROPOUT),
             nn.Linear(self.num_embed * self.inner_scaling, self.num_embed),
         )
 
