@@ -4,23 +4,22 @@ It is built on the PyTorch / Lightning architecture.
 Written by: Artur Jaroszewicz (@beyondtheproof)
 """
 
-from typing import Dict, Any
+from typing import Dict
 import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.optim import Adam
+from torch.optim import Adam, AdamW
 
 import lightning as L
 
+from .data import AA_VOCAB_SIZE, GO_VOCAB_SIZE
 
 AA_MAX_LEN: int = 36000
-AA_VOCAB_SIZE: int = 24 + 2  # 24 amino acids and <SOS>, <EOS>
 
 GO_MAX_LEN: int = 256  # T
 NUM_EMBED: int = 16  # C
-GO_VOCAB_SIZE: int = 18789 + 2  # 18789 GO terms and <SOS>, <EOS>
 
 HEAD_SIZE: int = NUM_EMBED
 NUM_HEADS: int = 4
@@ -49,6 +48,7 @@ class EncoderHead(L.LightningModule):
         self.head_size = head_size
 
         # Add self-attention heads
+        # We do not add a bias nor a ReLU here -- this is truly a linear projection
         self.query = nn.Linear(self.num_embed, self.head_size, bias=False)
         self.key = nn.Linear(self.num_embed, self.head_size, bias=False)
         self.value = nn.Linear(self.num_embed, self.head_size, bias=False)
@@ -121,7 +121,7 @@ class AAEncoder(L.LightningModule):
         # This is the 'div' term because of the -log(10_000)
         # We do range(0, 2, ..., num_embed-2) because each of these values goes to a specific
         # channel, and we have alternating sines and cosines, so we would double to get num_embed.
-        # PE_pos = sin(pos / 10_000^(2i / d_model)
+        # PE_pos = sin(pos / 10_000^(2i / d_model))
         div_term = torch.exp(
             # ---------- 2i ------------
             torch.arange(0, self.num_embed, 2)
@@ -152,8 +152,6 @@ class AAEncoder(L.LightningModule):
 
         self.vocab_size = vocab_size
         self.num_embed = num_embed
-        self.num_heads = num_heads
-        self.head_size = num_embed // self.num_heads
         self.max_len = max_len
         self.num_layers = num_layers
 
@@ -162,6 +160,11 @@ class AAEncoder(L.LightningModule):
         )
         self.register_positional_embedding()
         self.ln = nn.LayerNorm(self.num_embed)
+
+        # When we increase the number of heads, we decrease the embedding size of each head
+        # This is so we can concatenate across the last dimension (C) to get back to num_embed
+        self.num_heads = num_heads
+        self.head_size = num_embed // self.num_heads
         self.self_attention = nn.Sequential(
             *[
                 EncoderMultiHead(
@@ -214,8 +217,8 @@ class DecoderHead(L.LightningModule):
         self.weight_dropout = nn.Dropout(DROPOUT)
 
         # These are not weights, but a buffer, so it doesn't update with loss.backward()
-        # We take a 1s square matrix of size max_len, then just the lower triangle (with diagonal),
-        # setting the rest to 0s
+        # We take a 1s square matrix of size max_len, then just the lower triangle
+        # (including diagonal), setting the rest to 0s
         self.register_buffer("tril", torch.tril(torch.ones(max_len, max_len)))
 
     def forward(self, x):
@@ -225,17 +228,21 @@ class DecoderHead(L.LightningModule):
         v = self.value(x)
 
         # Dot product the queries and the keys, scale by the number of channels
-        # q.shape: (B, T, C)
-        # k.transpose.shape: (B, C, T)
-        # weights.shape: (B, T, T)
+        # q.shape: (B, Tq, C)
+        # k.transpose.shape: (B, C, Tk)
+        # weights.shape: (B, Tq, Tk)
         weights = q @ k.transpose(-2, -1) * (C**-0.5)
 
         # Wherever tril (up to size T) is 0 (upper triangle), set the corresponding weights to -inf
+        # We use -inf as the logit value, which corresponds to a probability of 0
         weights = weights.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
+        # Funny enough, setting the dropped out weights to 0 and not -inf is fine
+        # This is because the value is set, so the gradient can't flow through it
+        # We'll have a weird loss, but that's okay
         weights = self.weight_dropout(weights)
         weights = weights.softmax(dim=-1)
 
-        # (B, T, T) @ (B, T, head_size) -> (B, T, head_size)
+        # (B, Tq, Tk) @ (B, Tv, head_size) -> (B, Tq, head_size)
         out = weights @ v
         return out
 
@@ -283,7 +290,6 @@ class GODecoder(L.LightningModule):
         vocab_size: int = GO_VOCAB_SIZE,
         num_embed: int = NUM_EMBED,
         num_heads: int = NUM_HEADS,
-        # head_size: int = HEAD_SIZE,
         max_len: int = GO_MAX_LEN,
     ):
         super().__init__()
@@ -358,9 +364,14 @@ class EncoderDecoderHead(L.LightningModule):
         enc_k = self.encoder_key(x_enc)
         enc_v = self.encoder_value(x_enc)
 
+        # Actually doesn't matter whether we scale by C_enc or C_dec, they're the same
+        # dec_q: B, T_dec, C
+        # enc_k.transpose(-2, -1): B, C, T_enc
+        # weights: (B, T_dec, T_enc)
         weights = dec_q @ enc_k.transpose(-2, -1) * (C_enc**0.5)
         weights = weights.softmax(dim=-1)
 
+        # out: (B, T_dec, T_enc) @ (B, T_enc, C) -> (B, T_dec, C)
         out = weights @ enc_v
 
         return out
@@ -454,10 +465,10 @@ class Transformer(L.LightningModule):
         x_attn = dec_embed + self.cross_attention_head(enc_embed, dec_embed)
 
         # Final dense layer
-        x_attn = self.feed_fwd(self.post_x_attn_ln(x_attn))
+        dense = self.feed_fwd(self.post_x_attn_ln(x_attn))
 
         # Get the logits
-        logits = self.out_head(self.post_ffwd_ln(x_attn))
+        logits = self.out_head(self.post_ffwd_ln(dense))
 
         return logits
 
@@ -511,9 +522,10 @@ class Transformer(L.LightningModule):
         return loss
 
     def validation_step(self, data):
-        loss = self.get_loss(data)
-        self.log("val_loss", loss)
-        return loss
+        with torch.no_grad():
+            loss = self.get_loss(data)
+            self.log("val_loss", loss)
+            return loss
 
     def generate(
         self,
@@ -537,8 +549,12 @@ class Transformer(L.LightningModule):
         end_token = self.out_eos.tolist()
         with torch.no_grad():
             while dec_input.size(-1) < max_out_len:
-                logits, _ = self({"seq": enc_input, "go": dec_input})
+                # Get the logits
+                logits = self({"seq": enc_input, "go": dec_input})
+
+                # Argmax to find the next output token
                 next_token = torch.argmax(logits, -1)
+                # Add to the decoder
                 dec_input = torch.cat(
                     [dec_input, next_token[..., -1].unsqueeze(1)], dim=-1
                 )
@@ -549,3 +565,67 @@ class Transformer(L.LightningModule):
                     break
 
         return dec_input
+
+
+class AAEncoderBoW(L.LightningModule):
+    def __init__(
+        self,
+        dec_vocab_size: int = GO_VOCAB_SIZE,
+        num_heads: int = NUM_HEADS,
+        ffwd_inner_scaling: int = INNER_SCALING,
+    ):
+        super().__init__()
+        self.dec_vocab_size = dec_vocab_size
+        self.ffwd_inner_scaling = ffwd_inner_scaling
+
+        self.encoder = AAEncoder(num_heads=num_heads)
+        self.post_enc_ln = nn.LayerNorm(self.encoder.num_embed)
+        self.feed_fwd = FeedForward(inner_scaling=self.ffwd_inner_scaling)
+        self.post_ffwd_ln = nn.LayerNorm(self.feed_fwd.num_embed)
+        self.out_head = nn.Linear(self.feed_fwd.num_embed, self.dec_vocab_size)
+
+        self.loss_fn = nn.BCEWithLogitsLoss()
+
+    def forward(self, data):
+        enc_input = data["seq"]
+
+        # "Time" is the last dimension, and we either have a flat vector or one with (Batch, Time)
+        # Here, we ensure data has 2 dimensions: (B, T)
+        enc_input = enc_input.view(-1, enc_input.size(-1))
+
+        # Get embeddings for encoder and decoder
+        enc_embed = self.encoder(enc_input)
+
+        # enc_embed: B, T, C -- we want to sum over time
+        enc_embed = enc_embed.sum(dim=-2)
+
+        # Final dense layer
+        dense = self.feed_fwd(self.post_enc_ln(enc_embed))
+
+        # Get the logits
+        logits = self.out_head(self.post_ffwd_ln(dense))
+
+        return logits
+
+    def get_loss(self, data):
+        logits = self(data)
+        targets = data["go_bow"]
+
+        loss = self.loss_fn(logits, targets)
+
+        return loss
+
+    def training_step(self, data):
+        loss = self.get_loss(data)
+        self.log("train_loss", loss)
+
+        return loss
+
+    def validation_step(self, data):
+        loss = self.get_loss(data)
+        self.log("val_loss", loss)
+
+        return loss
+
+    def configure_optimizers(self):
+        return AdamW(self.parameters())

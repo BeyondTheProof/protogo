@@ -27,6 +27,8 @@ COLUMNS = ["seq", "go"]
 SOS = "<SOS>"
 EOS = "<EOS>"
 BATCH_SIZE = 16
+AA_VOCAB_SIZE: int = 24 + 2  # 24 amino acids and <SOS>, <EOS>
+GO_VOCAB_SIZE: int = 18789 + 2  # 18789 GO terms and <SOS>, <EOS>
 
 
 class ProteinDataset(Dataset):
@@ -47,7 +49,11 @@ class ProteinDataset(Dataset):
         self.raw_data = data
         self.max_seq_size = max_seq_size
 
+        # This makes a (sorted) list of the tokens
         self.vocabs = self.get_vocabularies() if vocabs is None else vocabs
+
+        # This is an encoding for the tokens that returns an index,
+        # which is then used as the input to a one-hot matrix
         if encoding is None:
             self.encoding = {
                 col: {word: idx for idx, word in enumerate(self.vocabs[col])}
@@ -55,6 +61,8 @@ class ProteinDataset(Dataset):
             }
         else:
             self.encoding = encoding
+
+        # This is a decoding for the index, returning a token
         if decoding is None:
             self.decoding = {
                 col: {idx: word for idx, word in enumerate(self.vocabs[col])}
@@ -100,19 +108,29 @@ class ProteinDataset(Dataset):
         """
         vocabularies = {}
         for col in COLUMNS:
+            # We concatenate all the amino acids (input tokens), then take a set
+            # We sort for clarity and consistency
             if col == "seq":
                 all_chars = "".join([val for val in self.raw_data[col]])
                 vocabulary = sorted(list(set(all_chars)))
+
+            # We take all the GO terms, each of which is its own token
             elif col == "go":
                 all_go_terms = np.concatenate(
                     [*[val.split(";") for val in self.raw_data[col]]]
                 )
                 vocabulary = set(all_go_terms)
                 vocabulary = [v.strip() for v in vocabulary]
+                # We sort for clarity and consistency
                 vocabulary = sorted(list(set(vocabulary)))
             else:
                 raise NotImplementedError(f"{col} not implemented")
 
+            # We need to tell the encoder & decoder when we start and end.
+            # In theory, we don't always need both, but it doesn't hurt
+            # We use an SOS at the start of the decoded sentence, and an EOS to end it
+            # We start with this SOS so that we have some thing to start with that's not
+            # an actual GO term
             vocabulary.append(SOS)
             vocabulary.append(EOS)
             vocabularies[col] = vocabulary
@@ -148,13 +166,23 @@ class ProteinDataset(Dataset):
         """
         Splits off a part of the dataset to a validation dataset, re-initializing both
         """
-        self.raw_data["order"] = np.random.random(len(self))
-        self.raw_data.sort_values("order", inplace=True)
-        self.raw_data["is_train"] = self.raw_data.order < 1 - frac_val
+        # self.raw_data["order"] = np.random.random(len(self))
+        # self.raw_data.sort_values("order", inplace=True)
+        # self.raw_data["is_train"] = self.raw_data.order < 1 - frac_val
 
         # split into train and val
-        train_data = self.raw_data.query("is_train").reset_index()
-        val_data = self.raw_data.query("~is_train").reset_index()
+        # train_data = self.raw_data.query("is_train").reset_index()
+        # val_data = self.raw_data.query("~is_train").reset_index()
+
+        num_val_samples = int(len(self.raw_data) * frac_val)
+        val_samples = np.random.choice(
+            len(self.raw_data), size=num_val_samples, replace=False
+        )
+        train_samples = [
+            val for val in range(len(self.raw_data)) if val not in val_samples
+        ]
+        train_data = self.raw_data.iloc[train_samples]
+        val_data = self.raw_data.iloc[val_samples]
 
         kwargs = {
             "vocabs": self.vocabs,
@@ -173,13 +201,13 @@ class ProteinDataset(Dataset):
     def __getitem__(self, item: int):
         """
         Takes a single integer position in the length of the data and returns the integer-encoded data
-        :param item:
+        :param item: an integer of the iloc in the dataframe
         :return: a dict of {col: tensor}
         """
-        try:
-            item = int(item)
-        except:
-            raise ValueError(f"{item=} should be an int")
+        # try:
+        #     item = int(item)
+        # except:
+        #     raise ValueError(f"{item=} should be an int")
 
         data_line = self.raw_data.iloc[item]
         X, y = data_line[COLUMNS]
@@ -191,7 +219,11 @@ class ProteinDataset(Dataset):
         # We also end with EOS to say we're done generating terms
         y_enc = self.encode([SOS] + self.split_go_terms(y) + [EOS], COLUMNS[1])
 
-        return {"seq": X_enc, "go": y_enc}
+        # Make a Bag of Words (BoW) encoding
+        y_bow = torch.zeros(GO_VOCAB_SIZE, dtype=torch.float32)
+        y_bow[y_enc] = 1.0
+
+        return {"seq": X_enc, "go": y_enc, "go_bow": y_bow}
 
     def collate_batch(self, batch):
         """
@@ -207,6 +239,8 @@ class ProteinDataset(Dataset):
                 _input, batch_first=True, padding_value=self.encoding[col][EOS]
             )
             collated[col] = _padded
+
+        collated["go_bow"] = torch.stack([item["go_bow"] for item in batch])
 
         return collated
 

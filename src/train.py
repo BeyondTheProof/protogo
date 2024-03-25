@@ -31,12 +31,15 @@ def train_model_torch(model: nn.Module, dl_train, dl_val, args):
         ):
             if step % args.eval_interval == 0:
                 # We want to make sure we're not updating the model here
+                model.eval()
                 with torch.no_grad():
                     _val_losses = []
                     for val_batch in dl_val:
                         logits, loss = model(val_batch)
                         _val_losses.append(loss.item())
                     val_losses.append(np.mean(_val_losses))
+
+                model.train()
 
             logits, loss = model(train_batch)
             # Reset the gradients so we're not accumulating
